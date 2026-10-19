@@ -1,537 +1,531 @@
-import random
-from datetime import date, datetime
+from datetime import datetime
+from hashlib import sha256
+from math import comb
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="นิลชัวร์ | Fish Traceability",
+    page_title="นิลชัวร์ | Lot Screening",
     page_icon="🐟",
     layout="wide",
 )
 
-TILAPIA = "ปลานิล — Nile tilapia"
-BLACKCHIN = "ปลาหมอคางดำ — Blackchin tilapia"
-UNCLEAR = "Unable to identify"
-RESULTS = [TILAPIA, BLACKCHIN, UNCLEAR]
+FISH_DIR = Path(__file__).resolve().parent / "fish"
+NILE = "ปลานิล"
+BLACK = "ปลาหมอคางดำ"
 
-if "lots" not in st.session_state:
-    st.session_state.lots = {}
+st.title("🐟 นิลชัวร์")
+st.caption("Lot-based traceability and fish screening")
 
-lots = st.session_state.lots
+st.warning(
+    "PITCH PROTOTYPE — Species results come from filenames, not AI. "
+    "All confidence scores are simulated display values. "
+    "These selected photos cannot establish real model accuracy."
+)
+
+# A different state key avoids conflicts with the earlier prototype.
+if "pitch_lots_v2" not in st.session_state:
+    st.session_state.pitch_lots_v2 = {}
+
+lots = st.session_state.pitch_lots_v2
 
 
-def timestamp():
+def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def make_record(result, image, reviewer):
+def load_sets():
+    if not FISH_DIR.exists():
+        st.error("Create a folder named 'fish' next to app.py.")
+        st.stop()
+
+    supported = {".jpg", ".jpeg", ".png", ".webp"}
+    files = [
+        p for p in FISH_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in supported
+    ]
+
+    nile = sorted(
+        [p for p in files if p.name.lower().startswith("nile")],
+        key=lambda p: p.name,
+    )
+    black = sorted(
+        [p for p in files if p.name.lower().startswith("black")],
+        key=lambda p: p.name,
+    )
+
+    if len(nile) < 10 or len(black) < 4:
+        st.error(
+            f"Found {len(nile)} Nile images and {len(black)} blackchin images. "
+            "At least 10 Nile images and 4 blackchin images are required."
+        )
+        st.stop()
+
+    # Prefer different original image groups for the four blackchin slots.
+    # This still does not establish that the photos show distinct real fish.
+    black_picks = []
+    groups = set()
+
+    for path in black:
+        group = path.name.split(".rf.")[0]
+        if group not in groups:
+            black_picks.append(path)
+            groups.add(group)
+        if len(black_picks) == 4:
+            break
+
+    if len(black_picks) < 4:
+        for path in black:
+            if path not in black_picks:
+                black_picks.append(path)
+            if len(black_picks) == 4:
+                break
+
+    set_one = nile[:10]
+
+    # Rotate the list: reuse across sets, but not within a set.
+    set_two = (nile[5:] + nile[:5])[:10]
+
+    six_nile = nile[-6:]
+    set_three = [
+        six_nile[0], black_picks[0],
+        six_nile[1], six_nile[2],
+        black_picks[1], six_nile[3],
+        black_picks[2], six_nile[4],
+        six_nile[5], black_picks[3],
+    ]
+
     return {
-        "prediction": result,
-        "photo": image.getvalue() if image else None,
-        "screened_at": timestamp(),
-        "reviewer": reviewer,
-        "model_version": "SIMULATOR — no trained model",
-        "confidence": None,
-        "demo": True,
+        "Set 1 — 10 Nile tilapia": set_one,
+        "Set 2 — 10 Nile tilapia": set_two,
+        "Set 3 — 6 Nile + 4 blackchin tilapia": set_three,
     }
 
 
-def farm_complete(lot):
-    return len(lot["farm_checks"]) == len(lot["sample_ids"])
+sets = load_sets()
 
 
-def flagged(record):
-    return record["prediction"] != TILAPIA
+def demo_score(filename):
+    """Stable mock UI score, never a real inference result."""
+    value = int(sha256(filename.encode()).hexdigest()[:8], 16)
+    return round(95.0 + (value % 450) / 100, 1)
 
 
-def lot_on_hold(lot):
-    records = [
-        *lot["farm_checks"].values(),
-        *lot["shop_checks"].values(),
-    ]
-    return any(flagged(record) for record in records)
+def simulate_screening(paths):
+    records = []
+    for index, path in enumerate(paths, start=1):
+        species = BLACK if path.name.lower().startswith("black") else NILE
+        records.append({
+            # A temporary image number, NOT a permanent fish ID.
+            "sample_photo": index,
+            "filename": path.name,
+            "species": species,
+            "demo_confidence": demo_score(path.name),
+        })
+    return records
 
 
-def lot_status(lot):
-    if lot_on_hold(lot):
-        return "On hold — review required"
-    if not farm_complete(lot):
-        return "Farm screening"
-    if lot["arrived"]:
-        if len(lot["shop_checks"]) == lot["quantity"]:
-            return "Individual screening complete"
-        return "Received — individual screening"
-    if lot["dispatched"]:
-        return "In transit"
-    return "Ready for dispatch"
+def is_held(lot):
+    # Holds persist if ANY screening run has a blackchin result.
+    return any(
+        row["species"] == BLACK
+        for run in lot["runs"]
+        for row in run["records"]
+    )
 
 
-def choose_lot(key):
+def status(lot):
+    if is_held(lot):
+        return "On hold — species review required"
+    if not lot["runs"]:
+        return "Awaiting sample screening"
+    return "No blackchin flagged in screened samples"
+
+
+def select_lot(key):
     if not lots:
         st.info("Create a lot first.")
         return None
-    return st.selectbox("Select lot", list(lots), key=key)
+    return st.selectbox("Lot ID", list(lots.keys()), key=key)
 
 
-def show_record(record):
-    if record["photo"]:
-        st.image(record["photo"], width=320)
-    st.write("**Simulated prediction:**", record["prediction"])
-    st.write("**Recorded at:**", record["screened_at"])
-    st.write("**Operator:**", record["reviewer"])
+def show_results(run):
+    rows = run["records"]
+    black_count = sum(row["species"] == BLACK for row in rows)
+    nile_count = len(rows) - black_count
+
+    a, b, c = st.columns(3)
+    a.metric("Sample photos", len(rows))
+    b.metric("Nile tilapia", nile_count)
+    c.metric("Blackchin tilapia", black_count)
+
+    if black_count:
+        st.error(
+            f"DEMO RESULT: Blackchin tilapia detected in "
+            f"{black_count}/{len(rows)} sample photos. "
+            "Place the lot on hold and request expert inspection."
+        )
+    else:
+        st.success(
+            "DEMO RESULT: No blackchin tilapia detected "
+            "in these 10 sample photos."
+        )
+        st.info(
+            "This result does not establish that every fish "
+            "in the lot is Nile tilapia."
+        )
+
     st.caption(
-        "No real AI inference was performed. "
-        "No confidence score or accuracy claim is available."
+        f"Stage: {run['stage']} | Recorded: {run['time']} | "
+        "Scores below are simulated confidence—not accuracy, "
+        "precision, or food-safety ratings."
     )
 
+    for start in range(0, len(rows), 5):
+        columns = st.columns(5)
+        for column, row in zip(columns, rows[start:start + 5]):
+            with column:
+                st.image(str(FISH_DIR / row["filename"]), use_column_width=True)
+                st.markdown(f"**Photo {row['sample_photo']}**")
+                st.write(row["species"])
+                st.caption(
+                    f"Demo confidence: {row['demo_confidence']:.1f}%"
+                )
 
-def screening_form(lot_id, stage):
-    lot = lots[lot_id]
-    is_farm = stage == "farm"
-    checks = lot["farm_checks"] if is_farm else lot["shop_checks"]
-    ids = lot["sample_ids"] if is_farm else lot["fish_ids"]
-    remaining = [fish_id for fish_id in ids if fish_id not in checks]
-
-    if not remaining:
-        st.success("All required screening records have been entered.")
-        return
-
-    st.info(
-        "Photograph one whole fish from the side on a clean, flat surface. "
-        "Keep its physical ID attached to the correct fish. "
-        "Retake blurred or obstructed photos."
-    )
-
-    with st.form(f"{stage}_{lot_id}_screen"):
-        fish_id = st.selectbox("Fish ID", remaining)
-        image = st.file_uploader(
-            "Upload fish photograph",
-            type=["jpg", "jpeg", "png"],
-        )
-        result = st.selectbox(
-            "SIMULATOR: choose the result to test the workflow",
-            RESULTS,
-        )
-        reviewer = st.text_input("Operator name")
-        submitted = st.form_submit_button("Save screening record")
-
-    if submitted:
-        if image is None or not reviewer.strip():
-            st.error("Upload a photo and enter an operator name.")
-            return
-
-        checks[fish_id] = make_record(result, image, reviewer.strip())
-        lot["events"].append(
+    with st.expander("Screening details"):
+        table = pd.DataFrame([
             {
-                "time": timestamp(),
-                "event": f"{stage.title()} screening: {fish_id} → {result}",
+                "Sample photo": row["sample_photo"],
+                "Species — simulated": row["species"],
+                "Demo confidence (%)": row["demo_confidence"],
+                "Image": row["filename"],
             }
-        )
-        st.rerun()
+            for row in rows
+        ])
+        st.dataframe(table, hide_index=True, use_container_width=True)
 
-
-st.title("🐟 นิลชัวร์")
-st.caption("Farm-to-shop traceability • Know the fish. Know its origin.")
-st.warning(
-    "DEMONSTRATION ONLY: AI results are manually simulated. "
-    "Data and photographs are stored only in this browser session."
-)
 
 page = st.sidebar.radio(
-    "Workspace",
+    "Navigate",
     [
-        "Overview",
+        "Dashboard",
         "Create lot",
-        "Farm screening",
-        "Delivery & shop screening",
-        "Customer view",
-        "Model transparency",
+        "Screen sample",
+        "Customer lot page",
+        "Sampling risk",
     ],
 )
 
-st.sidebar.info(
-    "These workspaces demonstrate roles; they are not access controls. "
-    "Production requires authenticated farmer, seller, and reviewer accounts."
+st.sidebar.caption(
+    "Session-only prototype. No real AI, public QR links, "
+    "authentication, or permanent database."
 )
 
-if page == "Overview":
-    st.header("Traceability dashboard")
+if page == "Dashboard":
+    st.header("Lot dashboard")
 
     a, b, c = st.columns(3)
-    a.metric("Lots", len(lots))
-    b.metric("Lots on hold", sum(lot_on_hold(x) for x in lots.values()))
+    a.metric("Total lots", len(lots))
+    b.metric("Lots on hold", sum(is_held(lot) for lot in lots.values()))
     c.metric(
-        "Individually screened",
-        sum(len(x["shop_checks"]) for x in lots.values()),
+        "Screening runs",
+        sum(len(lot["runs"]) for lot in lots.values()),
     )
 
     if lots:
-        rows = []
-        for lot_id, lot in lots.items():
-            rows.append(
+        st.dataframe(
+            pd.DataFrame([
                 {
-                    "Lot ID": lot_id,
+                    "Lot": lot_id,
                     "Farm": lot["farm"],
                     "Shop": lot["shop"],
-                    "Fish": lot["quantity"],
+                    "Fish in lot": lot["quantity"],
                     "Expected arrival": lot["expected"],
-                    "Actual arrival": lot["arrived"] or "Not received",
-                    "Farm sample": (
-                        f'{len(lot["farm_checks"])}/{len(lot["sample_ids"])}'
-                    ),
-                    "Shop screening": (
-                        f'{len(lot["shop_checks"])}/{lot["quantity"]}'
-                    ),
-                    "Status": lot_status(lot),
+                    "Actual arrival": lot["arrival"] or "Not recorded",
+                    "Status": status(lot),
                 }
-            )
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                for lot_id, lot in lots.items()
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
     else:
-        st.info("Start by creating a lot such as CSF9238.")
+        st.info("Start with Create lot, then choose a demonstration image set.")
 
 elif page == "Create lot":
-    st.header("Create a lot before dispatch")
+    st.header("Create one ID for the whole lot")
+    st.caption("No individual fish IDs are required in this prototype.")
 
-    with st.form("create_lot"):
+    with st.form("new_lot"):
         left, right = st.columns(2)
+
         with left:
-            lot_id = st.text_input("Unique Lot ID", "CSF9238")
-            farm = st.text_input("Public farm name")
+            lot_id = st.text_input("Lot ID", "CSF9238")
+            farm = st.text_input("Farm public name", "Demo Farm")
             pond = st.text_input("Pond reference", "P03")
-            method = st.text_input("Declared farming method", "Closed pond")
             quantity = st.number_input(
-                "Number of fish", min_value=10, max_value=10000, value=100
+                "Fish in lot",
+                min_value=10,
+                max_value=100000,
+                value=100,
             )
+
         with right:
-            shop = st.text_input("Destination shop")
+            shop = st.text_input("Destination shop", "Tum's Fish Shop")
             harvest = st.date_input("Harvest date")
-            expected = st.date_input("Expected shop arrival")
-            delivery_reference = st.text_input("Delivery document reference")
-            notes = st.text_area(
-                "Public notes",
-                placeholder="Do not include private addresses or phone numbers.",
-            )
+            expected = st.date_input("Expected arrival")
+            document = st.text_input("Delivery document reference")
 
-        submitted = st.form_submit_button("Create lot")
+        submit = st.form_submit_button("Create lot")
 
-    if submitted:
+    if submit:
         lot_id = lot_id.strip().upper()
         if not lot_id or not farm.strip() or not shop.strip():
-            st.error("Lot ID, farm name, and shop name are required.")
+            st.error("Enter a Lot ID, farm, and shop.")
         elif lot_id in lots:
             st.error("This Lot ID already exists.")
         elif expected < harvest:
             st.error("Expected arrival cannot precede harvest.")
         else:
-            fish_ids = [
-                f"{lot_id}-F{i:03d}" for i in range(1, int(quantity) + 1)
-            ]
             lots[lot_id] = {
                 "farm": farm.strip(),
                 "pond": pond.strip(),
-                "method": method.strip(),
                 "shop": shop.strip(),
                 "quantity": int(quantity),
                 "harvest": str(harvest),
                 "expected": str(expected),
-                "delivery_reference": delivery_reference,
-                "notes": notes,
-                "fish_ids": fish_ids,
-                "sample_ids": sorted(random.sample(fish_ids, 10)),
-                "farm_checks": {},
-                "shop_checks": {},
-                "dispatched": None,
-                "arrived": None,
-                "received_quantity": None,
-                "temperature": None,
-                "condition": "",
-                "events": [
-                    {"time": timestamp(), "event": "Lot created"}
-                ],
+                "document": document.strip(),
+                "arrival": None,
+                "runs": [],
             }
-            st.success(f"Created {lot_id}. Continue to Farm screening.")
+            st.success(f"Lot {lot_id} created. Open Screen sample.")
 
-elif page == "Farm screening":
-    st.header("Farm: randomly sample 10 fish")
-    lot_id = choose_lot("farm_lot")
-
-    if lot_id:
-        lot = lots[lot_id]
-        st.write("**Lot status:**", lot_status(lot))
-        st.write("**Randomly selected IDs:**", ", ".join(lot["sample_ids"]))
-
-        st.caption(
-            "Assign physical fish IDs before random selection. "
-            "Do not substitute easier-to-photograph fish."
-        )
-        st.info(
-            "Sampling does not verify the entire lot. If exactly one fish "
-            "in a 100-fish lot is a different species, sampling 10 at random "
-            "has only a 10% chance of including it."
-        )
-
-        if lot_on_hold(lot):
-            st.error(
-                "Lot on hold. A suspected species mismatch or unclear result "
-                "requires review—not an automatic conclusion that the lot is unsafe."
-            )
-
-        screening_form(lot_id, "farm")
-
-        if lot["farm_checks"]:
-            st.subheader("Sample records")
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Fish ID": fish_id,
-                            "Simulated result": record["prediction"],
-                            "Recorded": record["screened_at"],
-                        }
-                        for fish_id, record in lot["farm_checks"].items()
-                    ]
-                ),
-                hide_index=True,
-                use_container_width=True,
-            )
-
-        st.caption(
-            "This prototype deliberately does not allow hold overrides. "
-            "Production needs an authorized expert-review and disposition workflow."
-        )
-
-elif page == "Delivery & shop screening":
-    st.header("Delivery and individual shop checks")
-    lot_id = choose_lot("shop_lot")
-
-    if lot_id:
-        lot = lots[lot_id]
-        st.write("**Status:**", lot_status(lot))
-
-        if lot_on_hold(lot):
-            st.error(
-                "Entire lot is on hold. Do not dispatch or offer remaining fish "
-                "for sale until an authorized review resolves the issue."
-            )
-
-        elif not farm_complete(lot):
-            st.info("Complete the 10 farm sample checks before dispatch.")
-
-        elif not lot["dispatched"]:
-            if st.button("Confirm dispatch now"):
-                lot["dispatched"] = timestamp()
-                lot["events"].append(
-                    {"time": timestamp(), "event": "Dispatched from farm"}
-                )
-                st.rerun()
-
-        elif not lot["arrived"]:
-            st.write("**Dispatched:**", lot["dispatched"])
-
-            with st.form(f"receive_{lot_id}"):
-                arrival = st.date_input("Actual shop arrival", date.today())
-                received = st.number_input(
-                    "Fish received", min_value=0, value=lot["quantity"]
-                )
-                temp_text = st.text_input(
-                    "Measured receiving temperature in °C (optional)"
-                )
-                condition = st.text_area("Receiving-condition observations")
-                receive = st.form_submit_button("Confirm receipt")
-
-            if receive:
-                try:
-                    temperature = float(temp_text) if temp_text.strip() else None
-                except ValueError:
-                    st.error("Enter a numeric temperature or leave it blank.")
-                else:
-                    if arrival < date.fromisoformat(lot["dispatched"][:10]):
-                        st.error("Arrival cannot precede dispatch.")
-                    elif arrival > date.today():
-                        st.error("Actual arrival cannot be in the future.")
-                    elif int(received) != lot["quantity"]:
-                        st.error(
-                            "Quantity mismatch: reconcile the fish IDs and "
-                            "delivery records before continuing. This demo "
-                            "supports full-lot receipt only."
-                        )
-                    else:
-                        lot["arrived"] = str(arrival)
-                        lot["received_quantity"] = int(received)
-                        lot["temperature"] = temperature
-                        lot["condition"] = condition
-                        lot["events"].append(
-                            {"time": timestamp(), "event": "Received by shop"}
-                        )
-                        st.rerun()
-
-        else:
-            st.success(f'Received on {lot["arrived"]}')
-            st.write(
-                f'Individual checks: {len(lot["shop_checks"])}/{lot["quantity"]}'
-            )
-            screening_form(lot_id, "shop")
-
-elif page == "Customer view":
-    st.header("Customer fish passport")
+elif page == "Screen sample":
+    st.header("Choose a prepared sample")
     st.caption(
-        "This previews the page that an individual fish’s QR code would open."
+        "Selecting a set stands in for uploading 10 sample photographs. "
+        "These are curated demonstration sets, not actual random samples."
     )
 
-    lot_id = choose_lot("customer_lot")
+    lot_id = select_lot("screen_lot")
+
     if lot_id:
         lot = lots[lot_id]
-        fish_id = st.selectbox("Individual Fish ID", lot["fish_ids"])
-        record = lot["shop_checks"].get(fish_id)
+        st.write("**Lot status:**", status(lot))
 
-        st.subheader(fish_id)
-        st.write("**Lot ID:**", lot_id)
-
-        if lot_on_hold(lot):
-            st.error("LOT ON HOLD — review required. Not available for sale.")
-        elif not record:
-            st.warning("This fish has not completed individual shop screening.")
-        else:
-            st.success(
-                "Demo screening recorded: predicted tilapia. "
-                "This is not a food-safety certification."
+        if is_held(lot):
+            st.error(
+                "This lot is already on hold. Additional clean sample results "
+                "will not automatically release it."
             )
 
-        if record:
-            show_record(record)
-
-        origin, journey, education = st.tabs(
-            ["Origin & handling", "Journey & checks", "Know the difference"]
+        stage = st.radio(
+            "Who is checking?",
+            ["Farmer — before dispatch", "Seller — at receipt"],
+            horizontal=True,
         )
 
-        with origin:
-            st.write("**Declared species:**", TILAPIA)
+        if stage.startswith("Seller"):
+            with st.expander("Record shop arrival"):
+                with st.form(f"arrival_{lot_id}"):
+                    arrival = st.date_input("Actual arrival date")
+                    save_arrival = st.form_submit_button("Save arrival")
+                if save_arrival:
+                    if str(arrival) < lot["harvest"]:
+                        st.error("Arrival cannot precede harvest.")
+                    elif arrival > datetime.now().date():
+                        st.error("Actual arrival cannot be in the future.")
+                    else:
+                        lot["arrival"] = str(arrival)
+                        st.success("Actual arrival recorded.")
+
+        selected = st.selectbox("Prepared image set", list(sets.keys()))
+
+        with st.expander("Preview selected images"):
+            paths = sets[selected]
+            for start in range(0, 10, 5):
+                columns = st.columns(5)
+                for column, path in zip(columns, paths[start:start + 5]):
+                    with column:
+                        st.image(str(path), use_column_width=True)
+
+        if st.button("Run demonstration screening", type="primary"):
+            if stage.startswith("Seller") and not lot["arrival"]:
+                st.error("Record actual shop arrival before seller screening.")
+            else:
+                lot["runs"].append({
+                    "stage": stage,
+                    "set": selected,
+                    "time": now(),
+                    "records": simulate_screening(sets[selected]),
+                })
+
+        if lot["runs"]:
+            st.subheader("Latest screening")
+            show_results(lot["runs"][-1])
+
+            if is_held(lot):
+                st.warning(
+                    "Lot-level action: pause dispatch or sale, retain the "
+                    "screening evidence, and ask a qualified reviewer to "
+                    "check the suspected fish and investigate the source. "
+                    "Hold release is intentionally not implemented here."
+                )
+
+elif page == "Customer lot page":
+    st.header("Customer traceability page")
+    st.caption(
+        "Preview of the page a lot-level QR label would open. "
+        "All fish from the same lot share this record."
+    )
+
+    lot_id = select_lot("public_lot")
+
+    if lot_id:
+        lot = lots[lot_id]
+        st.subheader(f"Lot {lot_id}")
+
+        if is_held(lot):
+            st.error("LOT ON HOLD — species inspection required.")
+        elif lot["runs"]:
+            st.info(
+                "No blackchin flagged in the recorded sample screens. "
+                "The particular fish you buy may not have been photographed."
+            )
+        else:
+            st.warning("No sample screening recorded.")
+
+        left, right = st.columns(2)
+        with left:
             st.write("**Farm:**", lot["farm"])
             st.write("**Pond reference:**", lot["pond"])
-            st.write("**Farming method, declared by farm:**", lot["method"])
-            st.write("**Destination shop:**", lot["shop"])
-            st.write("**Harvest date:**", lot["harvest"])
+            st.write("**Declared species:**", NILE)
+            st.write("**Lot quantity:**", lot["quantity"])
+        with right:
+            st.write("**Shop:**", lot["shop"])
+            st.write("**Harvest:**", lot["harvest"])
             st.write("**Expected arrival:**", lot["expected"])
-            st.write("**Actual arrival:**", lot["arrived"] or "Not received")
-            st.write(
-                "**Delivery reference:**",
-                lot["delivery_reference"] or "Not provided",
+            st.write("**Actual arrival:**", lot["arrival"] or "Not recorded")
+
+        st.write(
+            "**Delivery reference:**",
+            lot["document"] or "Not provided",
+        )
+        st.caption("Origin and delivery fields are entered by the operator.")
+
+        st.subheader("Recorded sample screens")
+        if not lot["runs"]:
+            st.info("No results yet.")
+        for index, run in enumerate(lot["runs"], start=1):
+            with st.expander(f"Check {index}: {run['stage']} — {run['time']}"):
+                show_results(run)
+
+        st.subheader("Know the difference")
+        st.table(pd.DataFrame([
+            {
+                "Fish": "ปลานิล",
+                "English name": "Nile tilapia",
+                "Scientific name": "Oreochromis niloticus",
+            },
+            {
+                "Fish": "ปลาหมอคางดำ",
+                "English name": "Blackchin tilapia",
+                "Scientific name": "Sarotherodon melanotheron",
+            },
+        ]))
+
+        a, b = st.columns(2)
+        with a:
+            st.image(
+                str(sets["Set 1 — 10 Nile tilapia"][0]),
+                caption="Nile tilapia — label supplied by filename",
+                use_column_width=True,
             )
-            temp = lot["temperature"]
-            st.write(
-                "**Recorded receiving temperature:**",
-                f"{temp}°C" if temp is not None else "Not recorded",
+        with b:
+            black_example = next(
+                p for p in sets["Set 3 — 6 Nile + 4 blackchin tilapia"]
+                if p.name.lower().startswith("black")
             )
-            st.write(
-                "**Receiving observations:**",
-                lot["condition"] or "Not recorded",
-            )
-            if lot["notes"]:
-                st.write("**Farm notes:**", lot["notes"])
-            st.caption(
-                "These are operator-entered records, not independently "
-                "verified certificates."
+            st.image(
+                str(black_example),
+                caption="Blackchin tilapia — label supplied by filename",
+                use_column_width=True,
             )
 
-        with journey:
-            st.write(
-                "**Farm sample checks:**",
-                f'{len(lot["farm_checks"])}/10 recorded',
-            )
-            st.write(
-                "**Individual shop checks:**",
-                f'{len(lot["shop_checks"])}/{lot["quantity"]} recorded',
-            )
-            st.caption(
-                "Farm sample findings apply only to the sampled fish. "
-                "Individual shop findings apply to the photographed fish."
-            )
-            st.dataframe(
-                pd.DataFrame(lot["events"]),
-                hide_index=True,
-                use_container_width=True,
-            )
+        st.info(
+            "These are different species. A real identification guide should "
+            "compare expert-verified head, chin, fin, and tail features. "
+            "Do not rely on chin colour alone. The supplied images and "
+            "identification guidance need expert review before public use."
+        )
+        st.caption(
+            "Species screening does not test pathogens or certify food safety."
+        )
 
-        with education:
-            st.subheader("ปลานิล vs ปลาหมอคางดำ")
-            st.table(
-                pd.DataFrame(
-                    [
-                        {
-                            "Common name": "ปลานิล / Nile tilapia",
-                            "Scientific name": "Oreochromis niloticus",
-                        },
-                        {
-                            "Common name": "ปลาหมอคางดำ / Blackchin tilapia",
-                            "Scientific name": "Sarotherodon melanotheron",
-                        },
-                    ]
-                )
-            )
-            st.write(
-                "A production comparison guide should show verified side-by-side "
-                "photos with expert annotations of the head, chin, body, fins, "
-                "and tail."
-            )
-            st.warning(
-                "Visual identification guide pending fisheries-expert review. "
-                "Do not identify a fish by a dark chin alone: lighting, age, "
-                "and fish condition can affect appearance."
-            )
-            st.info(
-                "Species identity does not establish whether a fish carries "
-                "pathogens. Neither a photograph nor a QR code verifies "
-                "food safety or proves the pond contains only one species."
-            )
-
-elif page == "Model transparency":
-    st.header("What the AI numbers mean")
-
-    st.error(
-        "No trained model is connected. All predictions in this prototype "
-        "are selected manually to demonstrate the workflow."
+elif page == "Sampling risk":
+    st.header("What can a random sample miss?")
+    st.write(
+        "A clean sample is useful evidence, but it cannot prove that "
+        "the rest of the lot contains no blackchin tilapia."
     )
 
-    metrics = [
-        (
-            "Individual confidence",
-            "A model score for one prediction—not a guarantee that it is correct.",
-        ),
-        (
-            "Test accuracy",
-            "Share of evaluated fish classified correctly on a held-out test set.",
-        ),
-        (
-            "Tilapia precision",
-            "Among fish predicted as tilapia, the share verified as tilapia.",
-        ),
-        (
-            "Blackchin tilapia recall",
-            "Among verified blackchin tilapia, the share detected by the model.",
-        ),
-        (
-            "Unable-to-identify rate",
-            "Share of cases where the system withholds a decision.",
-        ),
-    ]
-    st.table(pd.DataFrame(metrics, columns=["Metric", "Meaning"]))
+    total = st.number_input(
+        "Fish in lot", min_value=10, max_value=1000, value=100
+    )
+    mixed = st.number_input(
+        "Blackchin fish actually present — hypothetical",
+        min_value=0,
+        max_value=int(total),
+        value=1,
+    )
+    sample = st.slider(
+        "Number randomly sampled",
+        min_value=1,
+        max_value=int(total),
+        value=min(10, int(total)),
+    )
 
-    st.subheader("Required before deploying real AI")
+    n, k, s = int(total), int(mixed), int(sample)
+    miss_probability = (
+        comb(n - k, s) / comb(n, s)
+        if s <= n - k else 0.0
+    )
+    inclusion_probability = 1 - miss_probability
+
+    a, b = st.columns(2)
+    a.metric(
+        "Chance sample includes ≥1 blackchin fish",
+        f"{inclusion_probability:.1%}",
+    )
+    b.metric(
+        "Chance sample misses all blackchin fish",
+        f"{miss_probability:.1%}",
+    )
+
+    st.caption(
+        "Assumes a genuinely random sample without replacement and a known "
+        "hypothetical number of blackchin fish. This calculates inclusion "
+        "in the sample—not successful AI detection. AI mistakes can make "
+        "actual detection worse."
+    )
+
+    st.subheader("Practical risk reduction")
     st.markdown(
         """
-- Collect expert-labelled photos from actual farms and shops.
-- Keep photographs of the same fish out of different train/test splits.
-- Include other species and unsuitable images in evaluation.
-- Evaluate false tilapia predictions, not just overall accuracy.
-- Calibrate confidence scores and validate the review threshold.
-- Publish model version, test date, sample size, and limitations.
-- Keep expert review separate from the original model prediction.
+- Sample from across containers and throughout unloading, not just the top.
+- Increase sample size when there are concerns about the source.
+- Keep different lots separate during transport, storage, and sale.
+- Inspect fish during normal sorting; refer uncertain fish for review.
+- Hold the lot when a suspected mismatch is found.
+- Describe results as sample findings, never a whole-lot guarantee.
 """
     )
 
 st.divider()
 st.caption(
-    "นิลชัวร์ prototype | Traceability and species screening are not "
-    "food-safety certification."
+    "Prototype data lasts only for the current Streamlit session. "
+    "A production system needs validated AI, persistent storage, "
+    "role-based access, review records, and public lot URLs for QR labels."
 )
